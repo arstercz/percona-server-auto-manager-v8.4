@@ -701,7 +701,7 @@ int my_handle_options(int *argc, char ***argv, const struct my_option *longopts,
  */
 
 void print_cmdline_password_warning() {
-  static bool password_warning_announced = false;
+  static bool password_warning_announced = true;
 
   if (!password_warning_announced) {
     my_message_local(WARNING_LEVEL, EE_USING_PASSWORD_ON_CLI_IS_INSECURE);

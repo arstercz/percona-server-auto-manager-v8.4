@@ -27,6 +27,7 @@
 
 #include <stdio.h>
 #include <sys/types.h>
+#include <time.h>
 
 #include "client/my_readline.h"
 #include "m_string.h"
@@ -258,4 +259,32 @@ char *intern_read_line(LINE_BUFFER *buffer, ulong *out_length) {
     DBUG_DUMP("Query: ", (unsigned char *)buffer->start_of_line, *out_length);
     return buffer->start_of_line;
   }
+}
+
+char *get_current_time(void)
+{
+        static char date_str[20];
+        time_t date;
+
+        time(&date);
+        strftime(date_str,
+                sizeof(date_str), "%Y-%m-%dT%H:%M:%S", localtime(&date));
+
+        return date_str;
+}
+
+int record_all_history(const char *filename, const char *sql, 
+                       const char *host, unsigned  int port, const char *db)
+{
+        FILE *fp;
+        fp = fopen(filename, "a+");
+        if(!fp) {
+                //fprintf(stderr, "%s opening failed", filename);
+                return 1;
+        }
+        fprintf(fp, "[%s host:%s port:%d pid:%d ppid:%d login:%s user:%s shell:%s cwd:%s db:%s] %s\n", 
+                   get_current_time(), host, port, getpid(), getppid(), getenv("LOGNAME"),getenv("USER"), 
+                   getenv("SHELL"), getenv("PWD"), db, sql);
+        fclose(fp);
+        return 0;
 }

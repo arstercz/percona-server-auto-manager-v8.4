@@ -626,6 +626,9 @@ extern my_off_t my_ftell(FILE *stream);
 // Maximum size of message  that will be logged.
 #define MAX_SYSLOG_MESSAGE_SIZE 1024
 
+// Maximus size of table threshold can be changed
+#define MAX_TSIZE 200
+
 /* Platform-independent SysLog support */
 enum my_syslog_options { MY_SYSLOG_PIDS = 1 };
 

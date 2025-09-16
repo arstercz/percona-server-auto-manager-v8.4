@@ -58,6 +58,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 #include "mysql/plugin_client_telemetry.h"
 #include "mysql/strings/int2str.h"
 #include "mysql/strings/m_ctype.h"
+#include <mysql/regexp_filter_custom.h>
 #include "nulls.h"
 #include "str2int.h"
 #include "strcont.h"
@@ -204,6 +205,8 @@ static const char *default_charset = MYSQL_AUTODETECT_CHARSET_NAME;
 #ifdef HAVE_READLINE
 static char *histfile;
 static char *histfile_tmp;
+static char *opt_record_file = "/tmp/.mysql_record_all";
+static char *record_tmp;
 #endif
 static char *opt_histignore = nullptr;
 static String glob_buffer, old_buffer;
@@ -245,6 +248,12 @@ static char *shared_memory_base_name = nullptr;
 #endif
 static uint opt_protocol = 0;
 static const CHARSET_INFO *charset_info = &my_charset_latin1;
+
+// table size threshold
+static uint opt_table_threshold = 0;
+// is enable sql_filter
+static bool opt_sql_filter = true;
+static int is_readonly = 0;
 
 static char *opt_oci_config_file = nullptr;
 static char *opt_authentication_oci_client_config_profile = nullptr;
@@ -2033,6 +2042,15 @@ static struct my_option my_long_options[] = {
      "password sandbox mode.",
      &opt_connect_expired_password, &opt_connect_expired_password, nullptr,
      GET_BOOL, NO_ARG, 0, 0, 0, nullptr, 0, nullptr},
+    {"table-threshold", OPT_TABLE_THRESHOLD,
+     "table size(MB) threshold for disabled alter syntax, default is 200",
+     &opt_table_threshold, &opt_table_threshold, 0,
+     GET_UINT, REQUIRED_ARG, 200, 0, 0, 0, 0, 0},
+    {"sql-filter", OPT_SQL_FILTER, "whether enable sql filter, default is true(1)",
+     &opt_sql_filter, &opt_sql_filter, 0, GET_BOOL, NO_ARG, 1, 0, 0, 0, 0, 0},
+    {"record-file", OPT_RECORD_ALL, "record all execute command.",
+     &opt_record_file, &opt_record_file, 0,
+     GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
 #ifndef NDEBUG
     {"build-completion-hash", 0,
      "Build completion hash even when it is in batch mode. It is used for "
@@ -3393,6 +3411,23 @@ static bool get_current_db() {
   return false;
 }
 
+static void readonly_check()
+{
+  MYSQL_RES *res;
+  /* Check whether is readonly */
+  if (!mysql_query(&mysql_handle, "SELECT @@read_only") &&
+      (res = mysql_use_result(&mysql_handle)))
+  {
+    MYSQL_ROW row= mysql_fetch_row(res);
+    if (row && row[0] && atoi(row[0]) == 1)
+      is_readonly = 1; // read only
+    else
+      is_readonly = 0; // read write
+
+    mysql_free_result(res);
+  }
+}
+
 /***************************************************************************
  The different commands
 ***************************************************************************/
@@ -3645,6 +3680,99 @@ static int com_go_impl(String *buffer, char *line [[maybe_unused]]) {
     return opt_reconnect ? -1 : 1;  // Fatal error
   }
   if (verbose) (void)com_print(buffer, nullptr);
+
+  // recotd all sql
+  if (strlen(opt_record_file)) {
+    if (!(record_tmp= (char*) my_malloc(PSI_NOT_INSTRUMENTED, (uint) strlen(opt_record_file) + strlen(getenv("USER")) + 2,
+                                        MYF(MY_WME))))
+    {
+      fprintf(stderr, "Couldn't allocate memory for record file!\n");
+    } else {
+      sprintf(record_tmp, "%s.%s", opt_record_file, getenv("USER"));
+      if (record_all_history(record_tmp, buffer->ptr(), mysql_handle.host, mysql_handle.port, mysql_handle.db)) {
+        fprintf(stderr, "record all error!\n");
+      }
+    }
+  }
+
+  // only allow set names and select when enable read_only
+  if (is_readonly && 
+       (regexp_filter_sql((char *)"^INSERT|^UPDATE|^DELETE|^REPLACE|^CREATE|^DROP|^ALTER|^TRUNCATE", buffer->ptr()))) {
+    fprintf(stderr, "\n\t[WARN] - read_only is enabled, \
+maybe a slave instance, ignore all SQL that causes chagne operations.\n\n");
+    return 0;
+  }
+
+  //match the table name from sql statement to disable alter big table.
+  if(opt_sql_filter &&
+      (regexp_filter_sql((char *)"^ALTER\\s+TABLE\\s+ADD\\s*", buffer->ptr()))) {
+    char *TableName = 
+      regexp_filter_match((char *)"^ALTER\\s+TABLE\\s+(\\S+)\\s+", buffer->ptr());
+
+    if (TableName != NULL && strlen(TableName) > 0)
+    {
+      MetaInfo metainfo = regexp_get_meta(mysql_handle.db, TableName);
+      char *dbname = metainfo.db;
+      char *tablename = metainfo.table;
+
+    if (dbname == NULL || mysql_handle.db == NULL)
+    {
+      fprintf(stderr, "\n\t[WARN] - Must 'use <database>' \
+before alter table, current database is null.\n\n");
+      return 0;
+    }
+
+    char sqlSize[350];
+    // ignore DATA_FREE, as TokuDB's DATA_FREE may be too big.
+    // read more from https://jira.percona.com/browse/PS-5704
+    sprintf(sqlSize, "select round(sum(DATA_LENGTH+INDEX_LENGTH)/1024/1024) \
+                      as size from information_schema.tables \
+                      where table_schema = '%s' and table_name = '%s'",
+            dbname, tablename);
+    if (mysql_query(&mysql_handle, sqlSize))
+    {
+      fprintf(stderr, "\t[WARN] - cann't get %s.%s size\n", 
+              dbname, tablename);
+      return 0;
+    }
+    MYSQL_RES *result_msg = mysql_store_result(&mysql_handle);
+    if (result_msg == NULL) {
+      fprintf(stderr, "\t[WARN] - cann't find %s.%s, error: %s\n",
+              mysql_handle.db, TableName, mysql_error(&mysql_handle));
+      return 0;
+    }
+    int tableSize = 0;
+    MYSQL_ROW row_result;
+    while ((row_result = mysql_fetch_row(result_msg)))
+    {
+      if (row_result[0] == NULL)
+      {
+        fprintf(stderr, "\t[WARN] - cann't get %s.%s size\n", 
+                dbname, TableName);
+        return 0;
+      } else
+        tableSize = atoi(row_result[0]);
+        if (tableSize >= (int)opt_table_threshold) {
+          fprintf(stderr, "\n\t[WARN] - the %s.%s size is %dMB, disallowed by administrator\n\n",
+                  dbname, tablename, tableSize);
+          return 0;
+        }
+     }
+    }
+    free(TableName); // free malloc space
+  }
+
+  //disallowed rules sql statement
+  if (opt_sql_filter) {
+    MatchRes match_response = regexp_filter_custom(buffer->ptr());
+    if (match_response.match)
+    {
+      fprintf(stderr, "\n\t[WARN]\n\t +-- %s\n\
+\t Caused by: %s\nthis sql syntax was disabled by administrator\n\n",
+              buffer->ptr(), match_response.comment);
+      return 0;
+    }
+  }
 
   if (skip_updates && (buffer->length() < 4 ||
                        my_strnncoll(charset_info, (const uchar *)buffer->ptr(),
@@ -5775,6 +5903,10 @@ static const char *construct_prompt() {
           break;
         case 'l':
           processed_prompt.append(delimiter_str);
+          break;
+        case 'i':
+          readonly_check();
+          processed_prompt.append(is_readonly == 1 ? "ro" : "rw");
           break;
         case 'T':
           if (mysql_handle.server_status & SERVER_STATUS_IN_TRANS)

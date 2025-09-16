@@ -31,6 +31,7 @@ ADD_SUBDIRECTORY(migrate_keyring)
 
 MYSQL_ADD_EXECUTABLE(mysql
   ${CMAKE_SOURCE_DIR}/sql-common/net_ns.cc
+  regexp_filter.c
   completion_hash.cc
   mysql.cc
   pattern_matcher.cc
